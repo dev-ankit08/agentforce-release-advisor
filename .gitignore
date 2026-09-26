@@ -1,0 +1,11 @@
+.env
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.cache/
+*.sqlite3
+
+# local testing only
+tests/
+requirements-dev.txt

@@ -1,0 +1,7 @@
+anthropic>=1.4.0
+slack_bolt>=1.21
+python-dotenv>=1.0
+requests>=2.31
+pydantic>=2.7
+pypdf>=5.0
+truststore>=0.10
