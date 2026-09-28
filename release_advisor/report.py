@@ -9,6 +9,10 @@ from pydantic import BaseModel, Field
 Severity = Literal["Critical", "High", "Medium", "Low"]
 
 
+Availability = Literal["Generally Available", "Beta", "Pilot", "Developer Preview", "Not stated"]
+PREVIEW_AVAILABILITY = ("Beta", "Pilot", "Developer Preview")
+
+
 class Evidence(BaseModel):
     """Where in the release notes an item comes from. Checked in code by evidence_guard."""
 
@@ -17,26 +21,39 @@ class Evidence(BaseModel):
     release_note_quote: str
 
 
-class BreakingIssue(Evidence):
-    title: str
+class RepoEvidence(BaseModel):
+    """Where in the agent's repository the item applies. Checked in code by evidence_guard.check_repo."""
+
+    repo_path: str
+    repo_excerpt: str
+
+
+class BreakingIssue(Evidence, RepoEvidence):
+    title: str  # phrased in the agent's terms: "<agent element>: <what happens to it>"
     severity: Severity
     affected_element: str
-    evidence: str
+    current_state: str  # how the agent / its metadata does it today (from the repository)
+    release_change: str  # what the release changes
     fix: str
 
 
-class UpcomingChange(Evidence):
+class UpcomingChange(Evidence, RepoEvidence):
     title: str
     severity: Severity
     effective: str
-    impact: str
+    affected_element: str
+    current_state: str
+    release_change: str
     action_needed: str
 
 
-class Enhancement(Evidence):
-    feature: str
+class Enhancement(Evidence, RepoEvidence):
+    feature: str  # phrased in the agent's terms: "<agent element>: <what it gains>"
+    availability: Availability
     applies_to: str
-    benefit: str
+    current_state: str
+    benefit: str  # as the release note describes it
+    how_to_adopt: str
 
 
 class AgentProfile(BaseModel):
@@ -66,6 +83,56 @@ class SectionRead(BaseModel):
     printed_pages: str
 
 
+# ---- phase 1: the agent dossier ---------------------------------------------------------------
+
+
+class TechnicalElement(BaseModel):
+    element: str  # e.g. "OB_OrderService.getStatus", "callout:Shopify_API", "subagent order_status"
+    kind: str  # e.g. "Apex class", "Named Credential", "Agent Script subagent", "Flow", "Permission set"
+    location: str  # path in the repository
+    detail: str  # platform features / APIs / settings it uses that a release could change
+
+
+class AgentDossier(BaseModel):
+    """What Claude learned from scanning the agent and all its dependencies (repository only)."""
+
+    agent_profile: AgentProfile
+    technical_inventory: list[TechnicalElement]
+    watch_topics: list[str]  # release-note subjects that would matter to this agent
+
+
+# ---- phase 2: candidates found while reading each chunk of the release notes ------------------
+
+
+class Candidate(Evidence):
+    category: Literal["breaking", "upcoming", "enhancement"]
+    title: str
+    severity: Severity
+    affected_element: str
+    rationale: str
+    effective: str
+    availability: Availability = "Not stated"
+    priority_topic: bool = False  # set in code: found in a priority-topic chunk (not part of the schema)
+
+
+class ReadingCoverage(BaseModel):
+    release: str
+    total_pdf_pages: int
+    pages_read: int
+    pages_not_read: list[int] = Field(default_factory=list)  # PDF pages whose chunk failed
+    chunks: int
+    priority_chunks: int
+    priority_topics: list[str] = Field(default_factory=list)
+    priority_sections: list[SectionRead] = Field(default_factory=list)
+    candidates_found: int = 0
+    candidates_unverified: int = 0  # dropped at chunk level: quote not on the cited page
+    failures: list[str] = Field(default_factory=list)
+
+    @property
+    def complete(self) -> bool:
+        return not self.pages_not_read
+
+
 class FinalReport(BaseModel):
     submitted: SubmittedReport
     agent_kind: str
@@ -78,7 +145,10 @@ class FinalReport(BaseModel):
     status: Literal["Green", "Amber", "Red"]
     score_breakdown: list[str] = Field(default_factory=list)
     removed_findings: list[str] = Field(default_factory=list)
-    sections_read: list[SectionRead] = Field(default_factory=list)
+    coverage: ReadingCoverage | None = None
+    sections_read: list[SectionRead] = Field(default_factory=list)  # sections Claude re-read while writing the report
+    dependencies_scanned: list[str] = Field(default_factory=list)  # repository paths in the dependency scan
+    dependency_notes: list[str] = Field(default_factory=list)
     cite_base_url: str = ""  # official release notes URL; "#page=<pdf page>" is appended per item
     pdf_pages: dict[int, int] = Field(default_factory=dict)  # printed page -> PDF page, for cited pages
 
@@ -120,6 +190,27 @@ _EVIDENCE = {
     },
 }
 
+_TITLE = {
+    "type": "string",
+    "description": (
+        "Heading in the agent's terms: '<agent element>: <what happens to it>', e.g. "
+        "'SystemKnowledge_Tooling credential: connected-app support ends'. Not the release-note title."
+    ),
+}
+_AFFECTED = {"type": "string", "description": "The agent element or metadata item: subagent, action, Apex class, credential, permission set, channel ..."}
+_CURRENT = {"type": "string", "description": "How the agent or its metadata does this today, from the repository (one or two sentences)."}
+_CHANGE = {"type": "string", "description": "What this release changes, as the release notes describe it (one or two sentences)."}
+_REPO_EVIDENCE = {
+    "repo_path": {"type": "string", "description": "Repository path of the file that shows the agent uses the element."},
+    "repo_excerpt": {
+        "type": "string",
+        "description": (
+            "A short verbatim excerpt (one line or phrase, at least ~15 characters) copied exactly from that file. "
+            "It is checked against the file; items whose excerpt is not found are discarded."
+        ),
+    },
+}
+
 SUBMIT_REPORT_TOOL = {
     "name": "submit_report",
     "description": (
@@ -151,28 +242,39 @@ SUBMIT_REPORT_TOOL = {
             },
             "breaking_issues": {
                 "type": "array",
-                "description": "Changes in this release that break, retire or require changes to something THIS agent uses.",
+                "description": (
+                    "Changes in this release that break, retire or require changes to an element THIS agent's "
+                    "Agent Script or metadata actually uses (shown by repo_excerpt)."
+                ),
                 "items": _obj(
                     {
-                        "title": {"type": "string"},
+                        "title": _TITLE,
                         "severity": _SEVERITY,
-                        "affected_element": {"type": "string", "description": "Subagent/topic/action/class/config affected."},
-                        "evidence": {"type": "string", "description": "What in the agent or repo is affected."},
-                        "fix": {"type": "string", "description": "The change the release notes call for."},
+                        "affected_element": _AFFECTED,
+                        "current_state": _CURRENT,
+                        "release_change": _CHANGE,
+                        "fix": {"type": "string", "description": "What to change in the agent or its metadata, per the release notes."},
+                        **_REPO_EVIDENCE,
                         **_EVIDENCE,
                     }
                 ),
             },
             "upcoming_changes": {
                 "type": "array",
-                "description": "Future-dated changes announced in these notes (enforcement dates, retirements, reroutes) that affect THIS agent.",
+                "description": (
+                    "Future-dated changes announced in these notes (enforcement dates, retirements, reroutes) that "
+                    "affect an element THIS agent's Agent Script or metadata actually uses."
+                ),
                 "items": _obj(
                     {
-                        "title": {"type": "string"},
+                        "title": _TITLE,
                         "severity": _SEVERITY,
                         "effective": {"type": "string", "description": "Date or release, as stated in the notes."},
-                        "impact": {"type": "string"},
-                        "action_needed": {"type": "string"},
+                        "affected_element": _AFFECTED,
+                        "current_state": _CURRENT,
+                        "release_change": {"type": "string", "description": "What is coming, as the release notes describe it."},
+                        "action_needed": {"type": "string", "description": "What to do in the agent or its metadata, and by when."},
+                        **_REPO_EVIDENCE,
                         **_EVIDENCE,
                     }
                 ),
@@ -180,15 +282,29 @@ SUBMIT_REPORT_TOOL = {
             "recommended_enhancements": {
                 "type": "array",
                 "description": (
-                    "New capabilities in these notes that this agent could adopt: better customer experience and "
-                    "business impact, better performance tracking for product managers, and improvements to the "
-                    "existing implementation."
+                    "New capabilities in these notes that a specific element of this agent could adopt: better "
+                    "customer experience and business impact, better tracking for product managers, or improvements "
+                    "to the existing implementation."
                 ),
                 "items": _obj(
                     {
-                        "feature": {"type": "string"},
-                        "applies_to": {"type": "string", "description": "The specific agent element or metadata it applies to."},
-                        "benefit": {"type": "string", "description": "The benefit as the release note describes it."},
+                        "feature": {
+                            "type": "string",
+                            "description": (
+                                "Heading in the agent's terms: '<agent element>: <what it gains>', e.g. "
+                                "'explain_apex_component: compiler-accurate Apex answers'. Not the release-note title."
+                            ),
+                        },
+                        "availability": {
+                            "type": "string",
+                            "enum": ["Generally Available", "Beta", "Pilot", "Developer Preview", "Not stated"],
+                            "description": "As the release notes label the feature (e.g. '(Beta)', '(Generally Available)').",
+                        },
+                        "applies_to": _AFFECTED,
+                        "current_state": _CURRENT,
+                        "benefit": {"type": "string", "description": "What the feature adds, as the release note describes it."},
+                        "how_to_adopt": {"type": "string", "description": "The concrete change to make in this agent."},
+                        **_REPO_EVIDENCE,
                         **_EVIDENCE,
                     }
                 ),
@@ -201,3 +317,52 @@ SUBMIT_REPORT_TOOL = {
         }
     ),
 }
+
+
+_STR = {"type": "string"}
+
+AGENT_DOSSIER_SCHEMA = _obj(
+    {
+        "agent_profile": SUBMIT_REPORT_TOOL["input_schema"]["properties"]["agent_profile"],
+        "technical_inventory": {
+            "type": "array",
+            "description": (
+                "Every element of the agent and its dependencies that a Salesforce release could affect: Agent "
+                "Script blocks and constructs, actions and their targets, Apex classes and the platform APIs they "
+                "call, Flows and their element types, objects and fields, permission sets, credentials and "
+                "callouts, channels, prompt templates, models, API versions."
+            ),
+            "items": _obj({"element": _STR, "kind": _STR, "location": _STR, "detail": _STR}),
+        },
+        "watch_topics": {
+            "type": "array",
+            "items": _STR,
+            "description": "Release-note subjects that would matter to this agent, as short phrases.",
+        },
+    }
+)
+
+CHUNK_FINDINGS_SCHEMA = _obj(
+    {
+        "candidates": {
+            "type": "array",
+            "items": _obj(
+                {
+                    "category": {"type": "string", "enum": ["breaking", "upcoming", "enhancement"]},
+                    "title": _STR,
+                    "severity": _SEVERITY,
+                    "affected_element": {"type": "string", "description": "Element of the agent or its dependencies it applies to."},
+                    "rationale": {"type": "string", "description": "Why it applies to this agent specifically."},
+                    "effective": {"type": "string", "description": "Date or release for upcoming changes as the notes state it, else \"\"."},
+                    "availability": {
+                        "type": "string",
+                        "enum": ["Generally Available", "Beta", "Pilot", "Developer Preview", "Not stated"],
+                        "description": "How the release notes label the feature, e.g. '(Beta)'; \"Not stated\" if unlabeled.",
+                    },
+                    **_EVIDENCE,
+                }
+            ),
+        },
+        "notes": {"type": "string", "description": "Anything relevant that could not be itemised, or \"\"."},
+    }
+)

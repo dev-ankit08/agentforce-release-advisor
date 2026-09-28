@@ -32,12 +32,16 @@ class AgentBundle:
     revision: str  # commit SHA, org release, ... - used for cache keys
     files: dict[str, str]  # path -> content of the agent's own definition files
     api_version: str | None  # sourceApiVersion of the enclosing project
-    related_components: list[str] = field(default_factory=list)  # names Claude can fetch via read_component
-    # Business context from the project: README, specs, test specs, and the source of the
-    # components the agent's actions call. path -> content
+    related_components: list[str] = field(default_factory=list)  # every component in the dependency scan
+    # Business context from the project: README, specs, test specs. path -> content
     project_context: dict[str, str] = field(default_factory=dict)
     # Metadata inventory of the project: type -> names, e.g. {"ApexClass": [...], "PermissionSet": [...]}
     inventory: dict[str, list[str]] = field(default_factory=dict)
+    # Full dependency scan (dependencies.py): every file the agent depends on, transitively, plus the
+    # permission sets / triggers / tests wired to them. path -> content (the agent's own files excluded)
+    dependencies: dict[str, str] = field(default_factory=dict)
+    dependency_outline: str = ""  # components and references found, for prompts and the CLI
+    dependency_notes: list[str] = field(default_factory=list)  # e.g. files left out over the size budget
 
 
 def clip(text: str, limit: int = MAX_FILE_CHARS) -> str:

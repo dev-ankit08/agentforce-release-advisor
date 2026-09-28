@@ -30,6 +30,14 @@ DEFAULT_ALLOWED_DOMAINS = [
 ]
 
 
+# Release-notes topics given preference. Short all-caps terms (AI, LLM) match as whole words, case-sensitive.
+DEFAULT_PRIORITY_TOPICS = [
+    "Agentforce", "Agent Script", "AIforce", "Claude", "Einstein", "Generative AI", "AI", "LLM",
+    "large language model", "Prompt Builder", "prompt template", "Model Context Protocol", "MCP",
+    "Atlas Reasoning", "agent action", "Data 360", "Data Cloud", "retriever", "Trust Layer",
+]
+
+
 def _list(name: str, default: list[str] | None = None) -> list[str]:
     raw = os.getenv(name, "")
     items = [x.strip() for x in raw.split(",") if x.strip()]
@@ -64,11 +72,22 @@ class Settings:
     # The one release every agent is assessed against; lookups for other releases are refused.
     # "latest" (default) = the current release according to help.salesforce.com; or pin e.g. "Winter '27".
     target_release: str = field(default_factory=lambda: os.getenv("TARGET_RELEASE", "latest"))
-    # Sections read in full are chosen from the techniques the agent uses (relevance.py); add more here,
-    # as table-of-contents titles, e.g. "Analytics,Sales".
-    extra_full_read_sections: list[str] = field(default_factory=lambda: _list("EXTRA_FULL_READ_SECTIONS"))
-    # Stop (never truncate) if the sections to read in full exceed this many tokens.
-    max_full_read_tokens: int = field(default_factory=lambda: int(os.getenv("MAX_FULL_READ_TOKENS", "400000")))
+    # The whole release-notes document is read, every page (relevance.py builds the reading plan).
+    # Topics given preference: read first, at ANTHROPIC_EFFORT, and weighted higher in the final report.
+    priority_topics: list[str] = field(default_factory=lambda: _list("PRIORITY_TOPICS", DEFAULT_PRIORITY_TOPICS))
+    # Size of each release-notes chunk sent to Claude (estimated tokens), and how many run in parallel.
+    scan_chunk_tokens: int = field(default_factory=lambda: int(os.getenv("SCAN_CHUNK_TOKENS", "60000")))
+    scan_concurrency: int = field(default_factory=lambda: int(os.getenv("SCAN_CONCURRENCY", "4")))
+    # A section/chunk outside the topic-named sections is a priority one at this many topic mentions per page.
+    priority_density: float = field(default_factory=lambda: float(os.getenv("PRIORITY_DENSITY", "5")))
+    # Model and effort for chunks outside the priority topics (every page is still read). Same as the main
+    # model and effort by default; lower them to save cost.
+    scan_model: str = field(default_factory=lambda: os.getenv("SCAN_MODEL") or os.getenv("ANTHROPIC_MODEL", "claude-opus-5"))
+    scan_effort: str = field(default_factory=lambda: os.getenv("SCAN_EFFORT") or os.getenv("ANTHROPIC_EFFORT", "high"))
+
+    # Dependency scan of the agent (dependencies.py): stop adding files beyond this many characters
+    # (files left out are listed in the report, never dropped silently).
+    dependency_max_chars: int = field(default_factory=lambda: int(os.getenv("DEPENDENCY_MAX_CHARS", "1500000")))
 
     # Where agent definitions come from: "github" (now) or "salesforce_org" (later).
     agent_source: str = field(default_factory=lambda: os.getenv("AGENT_SOURCE", "github"))

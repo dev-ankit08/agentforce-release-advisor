@@ -4,31 +4,35 @@ Supported layouts (anywhere in the repo, any number of SFDX projects):
   .../aiAuthoringBundles/<Name>/<Name>.agent            -> Agent Script agent
   .../genAiPlannerBundles/<Name>/<Name>.genAiPlannerBundle -> legacy Agent Builder agent
   .../genAiPlanners/<Name>.genAiPlanner-meta.xml         -> legacy Agent Builder agent
+
+The repository is downloaded once per commit as an archive, so the agent's full dependency graph
+(dependencies.py) can be scanned without one API call per file.
 """
 
 from __future__ import annotations
 
+import io
 import json
 import posixpath
 import re
+import tarfile
 import time
 from dataclasses import dataclass
 from urllib.parse import quote, urlparse
 
 import requests
 
+from .. import dependencies
 from .base import MAX_CONTEXT_FILE_CHARS, AgentBundle, AgentRef, AgentSource, clip
 
 _AGENT_SCRIPT_RE = re.compile(r"(?:^|/)aiAuthoringBundles/([^/]+)/[^/]+\.agent$")
 _PLANNER_BUNDLE_RE = re.compile(r"(?:^|/)genAiPlannerBundles/([^/]+)/[^/]+\.genAiPlannerBundle(?:-meta\.xml)?$")
 _PLANNER_RE = re.compile(r"(?:^|/)genAiPlanners/([^/]+)\.genAiPlanner-meta\.xml$")
-_TARGET_RE = re.compile(r"""target:\s*["']?(\w+)://([\w.]+)""")
-_XML_NAME_RE = re.compile(
-    r"<(?:genAiPluginName|genAiFunctionName|functionName|pluginName|invocationTarget)>\s*([\w.]+)\s*</"
-)
 
 _SNAPSHOT_TTL_SECONDS = 300
-MAX_INVOCABLE_SCAN = 25  # Apex classes scanned for @InvocableMethod when actions declare no targets
+MAX_ARCHIVE_BYTES = 300 * 1024 * 1024
+MAX_ARCHIVE_FILE_BYTES = 2 * 1024 * 1024  # larger text files are almost always generated data
+_SKIP_DIRS = ("/node_modules/", "/.sfdx/", "/.sf/", "/.git/")
 
 
 class GitHubError(RuntimeError):
@@ -64,6 +68,7 @@ class _Repo:
         self._session = session
         self._api = api_url.rstrip("/")
         self._snapshot: _Snapshot | None = None
+        self._archive: tuple[str, dict[str, str]] | None = None  # (sha, path -> text)
 
     @property
     def slug(self) -> str:
@@ -98,7 +103,39 @@ class _Repo:
         self._snapshot = _Snapshot(sha=sha, branch=branch, paths=paths, fetched_at=time.time())
         return self._snapshot
 
+    def archive(self) -> dict[str, str]:
+        """Every text file of the repository at the snapshot commit, downloaded once as a tarball."""
+        sha = self.snapshot().sha
+        if self._archive and self._archive[0] == sha:
+            return self._archive[1]
+        resp = self._session.get(f"{self._api}/repos/{self.slug}/tarball/{sha}", timeout=300, stream=True)
+        if not resp.ok:
+            raise GitHubError(f"Could not download {self.slug}@{sha[:7]} as an archive: HTTP {resp.status_code}")
+        buf = io.BytesIO()
+        for chunk in resp.iter_content(1 << 20):
+            buf.write(chunk)
+            if buf.tell() > MAX_ARCHIVE_BYTES:
+                raise GitHubError(f"{self.slug} archive is larger than {MAX_ARCHIVE_BYTES // (1 << 20)} MB.")
+        buf.seek(0)
+        files: dict[str, str] = {}
+        with tarfile.open(fileobj=buf, mode="r:gz") as tar:
+            for member in tar:
+                if not member.isfile() or member.size > MAX_ARCHIVE_FILE_BYTES:
+                    continue
+                # Entries are "<owner>-<repo>-<sha>/<path>"; drop the top-level folder.
+                path = member.name.split("/", 1)[1] if "/" in member.name else member.name
+                if any(d in "/" + path for d in _SKIP_DIRS) or not dependencies.is_text_path(path):
+                    continue
+                handle = tar.extractfile(member)
+                if handle is not None:
+                    files[path] = handle.read().decode("utf-8", errors="replace")
+        self._archive = (sha, files)
+        return files
+
     def read(self, path: str) -> str:
+        files = self.archive()
+        if path in files:
+            return files[path]
         sha = self.snapshot().sha
         return self._get(f"/contents/{quote(path)}?ref={sha}", raw=True).text
 
@@ -111,6 +148,7 @@ class GitHubAgentSource(AgentSource):
         branch: str | None = None,
         api_url: str = "https://api.github.com",
         session: requests.Session | None = None,
+        dependency_max_chars: int = 1_500_000,
     ):
         if not repo_urls:
             raise GitHubError("No repositories configured. Set GITHUB_REPOS to one or more GitHub repo URLs.")
@@ -118,6 +156,7 @@ class GitHubAgentSource(AgentSource):
         self._session.headers.update({"X-GitHub-Api-Version": "2022-11-28", "User-Agent": "agentforce-release-advisor"})
         if token:
             self._session.headers["Authorization"] = f"Bearer {token}"
+        self.dependency_max_chars = dependency_max_chars
         self._repos = {r.slug: r for r in (_Repo(u, self._session, api_url, branch) for u in repo_urls)}
 
     # ---- AgentSource -------------------------------------------------------------------------
@@ -169,47 +208,27 @@ class GitHubAgentSource(AgentSource):
             except (ValueError, GitHubError):
                 api_version = None
 
-        related: set[str] = set()
-        for content in files.values():
-            related.update(name for _, name in _TARGET_RE.findall(content))
-            related.update(_XML_NAME_RE.findall(content))
-
         project_paths = [p for p in snap.paths if not ref.project_root or p.startswith(ref.project_root + "/")]
-        inventory = build_inventory(project_paths)
-        context: dict[str, str] = {}
-        for path in _context_doc_paths(project_paths, ref.project_root):
-            try:
-                context[path] = clip(repo.read(path), MAX_CONTEXT_FILE_CHARS)
-            except GitHubError as exc:
-                context[path] = f"[could not read: {exc}]"
-        for name in sorted(related):
-            try:
-                source = self.read_component(ref, name)
-                path = source.split("\n", 1)[0].removeprefix("// ").strip()
-                context[path] = clip(source, MAX_CONTEXT_FILE_CHARS)
-            except GitHubError:
-                continue  # referenced component not in this repo (e.g. standard action)
-        if not related:
-            # Actions without declared targets (bare @actions.x): the project's invocable Apex classes
-            # are the candidates the agent's actions are registered from.
-            classes = [p for p in project_paths if p.endswith(".cls") and "/classes/" in p
-                       and not re.search(r"test", posixpath.basename(p), re.I)]
-            for path in classes[:MAX_INVOCABLE_SCAN]:
-                try:
-                    source = repo.read(path)
-                except GitHubError:
-                    continue
-                if "@InvocableMethod" in source:
-                    context[path] = clip(source, MAX_CONTEXT_FILE_CHARS)
+        archive = repo.archive()
+        project = {p: archive[p] for p in project_paths if p in archive}
+        project.update(files)
+        dep_scan = dependencies.scan(project, list(files), self.dependency_max_chars)
 
+        context = {
+            path: clip(project.get(path) or repo.read(path), MAX_CONTEXT_FILE_CHARS)
+            for path in _context_doc_paths(project_paths, ref.project_root)
+        }
         return AgentBundle(
             ref=ref,
             revision=snap.sha,
             files=files,
             api_version=api_version,
-            related_components=sorted(related),
+            related_components=sorted({k.split(":", 1)[1] for k in dep_scan.components} - {ref.name}),
             project_context=context,
-            inventory=inventory,
+            inventory=dependencies.build_inventory(project_paths),
+            dependencies={p: clip(c) for p, c in dep_scan.dependency_files().items()},
+            dependency_outline=dep_scan.outline(),
+            dependency_notes=dep_scan.notes,
         )
 
     def read_component(self, ref: AgentRef, name: str) -> str:
@@ -221,7 +240,7 @@ class GitHubAgentSource(AgentSource):
                 continue
             if any(path.endswith(c) for c in candidates):
                 return f"// {path}\n" + clip(repo.read(path))
-        raise GitHubError(f"No Apex class, Flow, GenAiFunction or GenAiPlugin named '{name}' found in {ref.location}.")
+        raise GitHubError(f"No component named '{name}' found in {ref.location}.")
 
     # ---- helpers -----------------------------------------------------------------------------
 
@@ -231,41 +250,6 @@ class GitHubAgentSource(AgentSource):
             return self._repos[slug]
         except KeyError as exc:
             raise GitHubError(f"Unknown repository for agent {ref.name}: {ref.location}") from exc
-
-
-_INVENTORY_RULES: list[tuple[str, re.Pattern]] = [
-    ("ApexClass", re.compile(r"/classes/([^/]+)\.cls$")),
-    ("ApexTrigger", re.compile(r"/triggers/([^/]+)\.trigger$")),
-    ("Flow", re.compile(r"/flows/([^/]+)\.flow-meta\.xml$")),
-    ("CustomObject", re.compile(r"/objects/([^/]+)/[^/]+\.object-meta\.xml$")),
-    ("CustomField", re.compile(r"/objects/([^/]+)/fields/([^/]+)\.field-meta\.xml$")),
-    ("PermissionSet", re.compile(r"/permissionsets/([^/]+)\.permissionset-meta\.xml$")),
-    ("ConnectedApp", re.compile(r"/connectedApps/([^/]+)\.connectedApp-meta\.xml$")),
-    ("ExternalClientApp", re.compile(r"/externalClientApps/([^/]+)\.eca-meta\.xml$")),
-    ("NamedCredential", re.compile(r"/namedCredentials/([^/]+)\.namedCredential-meta\.xml$")),
-    ("ExternalCredential", re.compile(r"/externalCredentials/([^/]+)\.externalCredential-meta\.xml$")),
-    ("ExternalService", re.compile(r"/externalServiceRegistrations/([^/]+)\.externalServiceRegistration-meta\.xml$")),
-    ("PromptTemplate", re.compile(r"/genAiPromptTemplates/([^/]+)\.genAiPromptTemplate-meta\.xml$")),
-    ("GenAiFunction", re.compile(r"/genAiFunctions/([^/]+)/")),
-    ("GenAiPlugin", re.compile(r"/genAiPlugins/([^/]+)\.genAiPlugin-meta\.xml$")),
-    ("Bot", re.compile(r"/bots/([^/]+)/")),
-    ("LightningWebComponent", re.compile(r"/lwc/([^/]+)/")),
-    ("StaticResource", re.compile(r"/staticresources/([^/.]+)")),
-    ("DataCloudObject", re.compile(r"/(?:dataStreamDefinitions|dataLakeObjectDefinitions|mktDataModelObjects)/([^/.]+)")),
-]
-
-
-def build_inventory(paths: list[str]) -> dict[str, list[str]]:
-    """Metadata inventory from file paths alone (no downloads)."""
-    found: dict[str, set[str]] = {}
-    for path in paths:
-        p = "/" + path
-        for kind, regex in _INVENTORY_RULES:
-            m = regex.search(p)
-            if m:
-                name = ".".join(m.groups())
-                found.setdefault(kind, set()).add(name)
-    return {kind: sorted(names) for kind, names in sorted(found.items())}
 
 
 def _context_doc_paths(paths: list[str], root: str) -> list[str]:
@@ -283,13 +267,21 @@ def _context_doc_paths(paths: list[str], root: str) -> list[str]:
 
 
 def _component_paths(name: str) -> list[str]:
+    obj, _, leaf = name.partition(".")
     return [
         f"/classes/{name}.cls",
+        f"/triggers/{name}.trigger",
         f"/flows/{name}.flow-meta.xml",
         f"/genAiFunctions/{name}/{name}.genAiFunction-meta.xml",
         f"/genAiFunctions/{name}.genAiFunction-meta.xml",
         f"/genAiPlugins/{name}.genAiPlugin-meta.xml",
         f"/genAiPromptTemplates/{name}.genAiPromptTemplate-meta.xml",
+        f"/objects/{name}/{name}.object-meta.xml",
+        f"/objects/{obj}/fields/{leaf}.field-meta.xml",
+        f"/permissionsets/{name}.permissionset-meta.xml",
+        f"/namedCredentials/{name}.namedCredential-meta.xml",
+        f"/externalCredentials/{name}.externalCredential-meta.xml",
+        f"/customMetadata/{name}.md-meta.xml",
     ]
 
 

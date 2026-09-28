@@ -1,7 +1,8 @@
 """Command-line entry point, for local testing without Slack.
 
   python -m release_advisor.cli list
-  python -m release_advisor.cli sections Order_Status_Returns_Agent        # what would be read in full (no Claude call)
+  python -m release_advisor.cli deps Order_Status_Returns_Agent            # the agent's full dependency scan (no Claude call)
+  python -m release_advisor.cli sections                                   # how the whole release notes will be read (no Claude call)
   python -m release_advisor.cli analyze Order_Status_Returns_Agent [--markdown report.md] [--json] [--fresh]
   python -m release_advisor.cli static Order_Status_Returns_Agent
   python -m release_advisor.cli notes list | fetch latest | toc latest | search latest "Agent Script"
@@ -43,13 +44,15 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="release_advisor")
     sub = parser.add_subparsers(dest="cmd", required=True)
     sub.add_parser("list", help="List agents in the configured source")
-    for name in ("analyze", "static", "sections"):
+    sub.add_parser("sections", help="Reading plan for the whole release notes (priority topics first)")
+    for name in ("analyze", "static", "deps"):
         p = sub.add_parser(name)
         p.add_argument("agent")
         if name == "analyze":
             p.add_argument("--focus", choices=["current", "next", "both"], default="both")
             p.add_argument("--question", default="")
-            p.add_argument("--fresh", action="store_true", help="Ignore cached report")
+            p.add_argument("--fresh", action="store_true", help="Write a new report (reuses the saved scan of this commit)")
+            p.add_argument("--rescan", action="store_true", help="Also re-read the agent and the whole release notes")
             p.add_argument("--json", action="store_true", help="Print the full report as JSON")
             p.add_argument("--markdown", metavar="FILE", help="Also write the full report as Markdown")
     notes = sub.add_parser("notes", help="Inspect official release-notes PDFs")
@@ -67,6 +70,10 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     logging.basicConfig(level=logging.INFO if args.verbose else logging.WARNING)
+    # Windows consoles default to cp1252; release-notes text contains characters it cannot encode.
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="replace")
     settings = get_settings()
 
     if args.cmd == "notes":
@@ -104,6 +111,20 @@ def main(argv: list[str] | None = None) -> int:
 
     service = AdvisorService(settings)
 
+    if args.cmd == "sections":
+        doc = service.advisor.target_doc(_progress)
+        plan = service.advisor.reading_plan(doc)
+        print(plan.summary())
+        print(f"Priority topics: {', '.join(settings.priority_topics)}")
+        for sec in plan.priority_sections:
+            print(f"  priority section  {sec.title:40} printed pp. {sec.printed_pages:10} {sec.reason}")
+        print("Reading order:")
+        for n, chunk in enumerate(plan.chunks, 1):
+            tag = "PRIORITY" if chunk.priority else "full    "
+            print(f"  {n:3}. {tag} {chunk.page_range(doc):32} ~{chunk.tokens:>7,} tok  "
+                  f"{', '.join(chunk.sections)[:60]}  [{chunk.reason()}]")
+        return 0
+
     if args.cmd == "list":
         for a in service.list_agents():
             print(f"{a.name:45} {a.kind:15} {a.location}  ({a.path})")
@@ -120,20 +141,16 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps([f.to_dict() for f in run_static_checks(bundle)], indent=2))
         return 0
 
-    if args.cmd == "sections":
+    if args.cmd == "deps":
         bundle = service.source.load_agent(resolution.agent)
-        doc = service.advisor.target_doc(_progress)
-        _, read, tokens = service.advisor.plan_sections(bundle, doc)
-        print(f"{bundle.ref.name} vs {doc.release}: {len(read)} sections read in full, ~{tokens:,} tokens "
-              f"(limit {settings.max_full_read_tokens:,})")
-        for r in read:
-            print(f"  - {r.section:35} printed pp. {r.printed_pages:10} {r.reason}")
-        print("Metadata inventory:", json.dumps(bundle.inventory))
-        print("Project context files:", ", ".join(bundle.project_context) or "(none)")
+        print(f"{bundle.ref.name}: {len(bundle.files)} definition file(s), {len(bundle.dependencies)} dependency file(s), "
+              f"~{sum(map(len, bundle.dependencies.values())):,} characters")
+        print(bundle.dependency_outline)
         return 0
 
     report, cached = service.analyze(
         resolution.agent, question=args.question, focus=args.focus, fresh=args.fresh, progress=_progress,
+        rescan=args.rescan,
     )
     if args.markdown:
         with open(args.markdown, "w", encoding="utf-8") as fh:

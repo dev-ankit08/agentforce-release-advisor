@@ -16,15 +16,17 @@ It works with any Agentforce agent defined in an SFDX project:
 ```
 Slack  ──(/agent-release, @mention)──▶  slack_app  ──▶  AdvisorService
                                                           ├─ AgentSource  (GitHub today, Salesforce org later)
+                                                          │     └─ dependencies: full dependency scan of the agent (transitive + wiring)
                                                           ├─ static_checks (deterministic, no LLM)
                                                           ├─ ReleaseNotesLibrary
                                                           │     └─ help_portal: latest release + official PDF export from help.salesforce.com
-                                                          ├─ relevance     (techniques the agent uses → sections read in full)
-                                                          ├─ ReleaseAdvisor → Claude
-                                                          │     ├─ full text of the selected sections (in context, cached)
-                                                          │     ├─ read_section            (read another section in full)
-                                                          │     ├─ search_release_notes / read_release_notes_pages  (locate passages)
-                                                          │     ├─ read_component          (Apex / Flow / GenAiFunction source)
+                                                          ├─ Phase 1  scanner.profile_agent      agent + every dependency file → agent dossier
+                                                          ├─ Phase 2  scanner.scan_release_notes EVERY page of the release notes, chunk by chunk
+                                                          │     ├─ relevance: reading plan (priority topics first, coverage checked in code)
+                                                          │     └─ evidence_guard on every candidate finding
+                                                          ├─ Phase 3  ReleaseAdvisor → Claude    candidates → report
+                                                          │     ├─ read_release_notes_pages / search_release_notes / read_section (confirm)
+                                                          │     ├─ read_component          (any file of the agent's project)
                                                           │     └─ submit_report           (strict JSON schema)
                                                           ├─ evidence_guard (drops any item whose quote isn't on its cited page)
                                                           ├─ scoring       (deterministic 0–100 score)
@@ -39,14 +41,19 @@ Slack  ──(/agent-release, @mention)──▶  slack_app  ──▶  AdvisorS
 - **Context line:** definition type, repo and commit, project API version, the release assessed
 - **Executive summary:** three plain sentences
 - **Agent profile** _(from your repository)_: business use case, capabilities, impact value
-- 🔴 **Breaking / must fix:** static-check findings plus release-driven issues, each with where, why, fix, a verbatim quote, and its page
-- 🟡 **Upcoming changes needing action:** future-dated changes announced in the release notes, such as release updates enforced later, model reroutes, or scheduled retirements
-- 🟢 **Recommended enhancements:** new capabilities in the release, each with what it applies to in your agent, the benefit as the release notes state it, a quote, and its page
-- **Footer:** caveats, the score breakdown, the sections read in full, and how many items were removed because their quote wasn't found on the cited page
+- **At a glance:** counts of must-fix items, upcoming changes, GA enhancements and beta/pilot enhancements
+- 🔴 **Breaking / must fix**, 🟡 **Upcoming changes needing action**, 🟢 **Enhancements, generally available** and 🧪 **Enhancements, beta / pilot / preview**, each laid out as a comparison:
+
+  | What it means for your agent | Today in your agent | Winter '27 change / what's coming / what it adds | What to do | Source |
+  |---|---|---|---|---|
+
+  Headings are written in the agent's terms (`SystemKnowledge_Tooling credential: connected-app support ends`), not as the release-note title. Beta, pilot and developer-preview features are listed separately from generally available ones, using the label the release notes give them.
+- **Only what applies to your agent:** every item cites a verbatim excerpt from your agent's Agent Script or metadata, as well as the release-notes quote. Both are checked in code, and items that can't point at your agent are dropped. Org-wide or tooling changes that don't touch the agent's elements are left out.
+- **Footer:** caveats, the score breakdown, how many release-notes pages were read (all of them, unless a chunk failed, which is flagged), the priority sections, the number of files in the agent scan, and how many items were removed because their quote wasn't found on the cited page
 
 **Page references** look like `p. 164 (PDF p. 168)`, with the printed page number first, followed by the page in the downloaded PDF.
 
-The **full report** is attached to the thread as a Markdown file. It has every item, every quote, and why each section was read.
+The **full report** is attached to the thread as a Markdown file. It has the tables, and an evidence section with every release-notes quote and repository excerpt.
 
 ## Evidence: the latest release notes, picked automatically
 
@@ -64,25 +71,37 @@ The **full report** is attached to the thread as a Markdown file. It has every i
    The Slack bot pre-fetches the notes at startup.
 3. **Fallbacks.** help.salesforce.com's export endpoint is internal to the site, not a published API. If it ever changes, you can save the PDF manually into `release_notes/`, or set `RELEASE_NOTES_PDF_URLS`. The bot uses that copy instead.
 
-## Relevant sections are read in full
+## How a review works
 
-The bot reads the release notes' table of contents, then decides from **the techniques your agent uses** which top-level sections Claude must read **in full**. It doesn't rely on search snippets. See `release_advisor/relevance.py`.
+### Phase 1: the agent and all its dependencies
 
-| Your agent / repository uses… | Read in full |
-|---|---|
-| Any Agentforce agent | Agentforce and Generative AI, AIforce, Release Updates |
-| Apex (`apex://` actions or Apex classes) | Platform (Apex, sharing, developer changes) |
-| Flows (`flow://` actions or Flows) | Automation |
-| Permission sets, Connected / External Client Apps, Named / External Credentials, External Services, HTTP callouts | Security, Identity, and Privacy |
-| `@MessagingSession` variables, a customer/service agent, messaging channels, human escalation | Service |
-| Slack, or an employee agent | Slack Integrations |
-| Data library, retriever, Data Cloud | Data 360 |
+The repository is downloaded once per commit as an archive. `release_advisor/dependencies.py` then crawls the agent's dependency graph inside its SFDX project. No list of what to look at is hard-coded; any project component whose API name appears in a scanned file is followed:
 
-- **Change-log entries:** each selected section's entries in the "Release Note Changes by Month" log are included too, for example the Agentforce model reroute dates.
-- **Claude can read more:** Claude also sees the full table of contents. If another section is relevant to your agent, it reads that one in full with `read_section`. The report lists every section read and why.
-- **Adding sections:** use `EXTRA_FULL_READ_SECTIONS=Analytics,Sales`.
-- **Size limit:** if the full-read text would exceed `MAX_FULL_READ_TOKENS` (default 400k), the bot stops and lists the sections. It never truncates. For example, `Order_Status_Returns_Agent` reads 6 sections, about 230k tokens.
-- **Preview:** `python -m release_advisor.cli sections <Agent>` shows what would be read, and why, with no Claude call.
+- **Forward, transitively:** the agent's actions → their Apex classes, Flows, GenAiFunctions and prompt templates → the classes, subflows, objects, fields, custom metadata, labels, named/external credentials and so on that those use, until nothing new is found.
+- **Wiring:** permission sets and groups, profiles, triggers, Apex tests, flows, bots and connected/external client apps that reference anything in the forward set. These are added, but not expanded further.
+- **Not in the project:** declared targets that are standard or org-only actions are listed as such.
+
+Claude reads the agent definition, the README and specs, and **every file of that scan**, and writes the **agent dossier**. The dossier holds the business profile, a technical inventory of every element a release could affect (with its location), and the release-note subjects to watch for. If the scan exceeds `DEPENDENCY_MAX_CHARS` (default 1.5M characters), the files left out are listed in the report. Nothing is dropped silently.
+
+Preview the scan with no Claude call: `python -m release_advisor.cli deps <Agent>`.
+
+### Phase 2: the whole release notes, AI topics first
+
+No section is chosen or skipped by rules. `release_advisor/relevance.py` splits the **entire** document, first PDF page to last, into chunks of about `SCAN_CHUNK_TOKENS` (default 60k). It checks in code that every page is covered exactly once. Claude reads every chunk in full with the dossier in context, and returns candidate findings with verbatim quotes. Each quote is checked against its page right away.
+
+**Preference for AI topics.** Sections and chunks about the `PRIORITY_TOPICS` are marked as priority. The defaults are Agentforce, Agent Script, AIforce, Claude, Einstein, Generative AI, AI, LLM, Prompt Builder, MCP, Data 360 and similar. A section is a priority section when its title names a topic, or when its pages mention the topics at least `PRIORITY_DENSITY` times per page (default 5). A chunk elsewhere counts as priority when its own pages are that dense. Priority chunks are:
+
+- read first,
+- read with `ANTHROPIC_MODEL` / `ANTHROPIC_EFFORT`. The other chunks use `SCAN_MODEL` / `SCAN_EFFORT`, which default to the same; lower them to save cost.
+- marked `priority_topic` and listed first in the report.
+
+Every other chunk is still read in full. For Winter '27 that's all 1,096 PDF pages in 19 chunks, about 720k tokens, 6 of them priority chunks. The dossier prefix is cached across chunks, and chunks run `SCAN_CONCURRENCY` (default 4) at a time. A chunk that fails twice is reported as pages not read, never passed off as a complete read.
+
+Preview the reading plan with no Claude call: `python -m release_advisor.cli sections`.
+
+### Phase 3: the report
+
+Claude receives the dossier, all verified candidates and the reading coverage. It merges duplicates, drops candidates that don't hold up, and checks implementation details with `read_component`. It can also re-read pages to confirm. It then submits the report, and every quote is checked again.
 
 ## How "strictly from the release notes" is enforced
 
@@ -141,7 +160,8 @@ Set `ANTHROPIC_API_KEY`. The defaults are `claude-opus-5`, adaptive thinking, an
 Try a full analysis from the terminal:
 
 ```bash
-python -m release_advisor.cli sections Order_Status_Returns_Agent                      # which sections are read in full, and why (no Claude call)
+python -m release_advisor.cli deps Order_Status_Returns_Agent                          # the agent's full dependency scan (no Claude call)
+python -m release_advisor.cli sections                                                 # reading plan for the whole release notes (no Claude call)
 python -m release_advisor.cli analyze Order_Status_Returns_Agent --markdown report.md  # full report with quotes and page numbers
 python -m release_advisor.cli analyze Order_Status_Returns_Agent --json > report.json
 ```
@@ -167,7 +187,7 @@ Socket Mode needs no public URL. The bot can run on any host that has outbound i
 | `/agent-release list` | Lists all agents found in the configured source |
 | `/agent-release <AgentName>` | Report covering the current and upcoming releases |
 | `/agent-release <AgentName> next` | Focuses on the upcoming release (`current` focuses on the current one) |
-| `/agent-release <AgentName> refresh` | Ignores the cached result and runs a new analysis |
+| `/agent-release <AgentName> refresh` | Writes a new report. The agent scan and release-notes read for the same commit are reused (`cli analyze --rescan` re-reads them too) |
 | `@Release Advisor is Order_Status_Returns_Agent ready for the next release?` | Answers a free-text question in the thread |
 
 Reports are cached per agent, commit SHA, and focus for `CACHE_TTL_HOURS` (default 24). A new commit to the agent triggers a new analysis automatically.
@@ -188,7 +208,9 @@ release_advisor/
   static_checks.py     Agent Script structural checks (undefined actions/transitions, missing blocks)
   advisor.py           Claude loop: prompts, tools, pause_turn handling, report finalisation
   report.py            submit_report schema + Pydantic models
-  relevance.py         techniques the agent uses -> release-notes sections read in full
+  dependencies.py      full dependency scan of the agent inside its SFDX project
+  scanner.py           phase 1 (agent dossier) and phase 2 (read every chunk of the release notes)
+  relevance.py         reading plan: every page, priority topics first
   evidence_guard.py    drops any item whose quote is not on its cited page
   source_guard.py      allowed download hosts for manual PDF links
   scoring.py           deterministic score/status

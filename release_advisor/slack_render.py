@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from .report import FinalReport
+from .report import PREVIEW_AVAILABILITY, FinalReport
 from .sources import AgentRef
 
 MAX_ITEMS_PER_SECTION = 5
@@ -23,11 +23,6 @@ def _cite(report: FinalReport, item) -> str:
     return f"_{esc(item.section)}, {ref}_"
 
 
-def _quote(item, limit: int = 300) -> str:
-    q = item.release_note_quote.strip().replace("\n", " ")
-    return "> " + esc(q[:limit] + ("…" if len(q) > limit else ""))
-
-
 def _section(text: str) -> dict:
     if len(text) > SECTION_TEXT_LIMIT:
         text = text[: SECTION_TEXT_LIMIT - 1] + "…"
@@ -38,74 +33,114 @@ def _context(text: str) -> dict:
     return {"type": "context", "elements": [{"type": "mrkdwn", "text": text[:SECTION_TEXT_LIMIT]}]}
 
 
-def _list_section(title: str, lines: list[str]) -> list[dict]:
-    if not lines:
-        return [_section(f"*{title} (0)*\n_None found._")]
-    blocks = [_section(f"*{title} ({len(lines)})*")]
-    blocks += [_section(line) for line in lines[:MAX_ITEMS_PER_SECTION]]
-    if len(lines) > MAX_ITEMS_PER_SECTION:
-        blocks.append(_context(f"+{len(lines) - MAX_ITEMS_PER_SECTION} more in the attached full report."))
-    return blocks
+def _coverage_warnings(report: FinalReport) -> list[str]:
+    lines = list(report.dependency_notes)
+    if report.coverage and report.coverage.pages_not_read:
+        lines += report.coverage.failures
+        lines.append(f"{len(report.coverage.pages_not_read)} release-notes page(s) could not be read; findings "
+                     "on those pages may be missing.")
+    return lines
+
+
+def _split_enhancements(report: FinalReport) -> tuple[list, list]:
+    """(generally available or unlabeled, beta / pilot / developer preview)."""
+    items = report.submitted.recommended_enhancements
+    return ([e for e in items if e.availability not in PREVIEW_AVAILABILITY],
+            [e for e in items if e.availability in PREVIEW_AVAILABILITY])
+
+
+def _item_block(report: FinalReport, heading: str, cells: list[tuple[str, str]], item) -> dict:
+    fields = [{"type": "mrkdwn", "text": f"*{label}*\n{esc(value)}"[:1990]} for label, value in cells if value]
+    fields.append({"type": "mrkdwn", "text": f"*Source*\n{_cite(report, item)}"[:1990]})
+    return {"type": "section", "text": {"type": "mrkdwn", "text": heading[:SECTION_TEXT_LIMIT]}, "fields": fields[:10]}
+
+
+def _group(title: str, blocks: list[dict], empty: str = "None found.") -> list[dict]:
+    if not blocks:
+        return [_section(f"*{title} (0)*\n_{empty}_")]
+    out = [_section(f"*{title} ({len(blocks)})*"), *blocks[:MAX_ITEMS_PER_SECTION]]
+    if len(blocks) > MAX_ITEMS_PER_SECTION:
+        out.append(_context(f"+{len(blocks) - MAX_ITEMS_PER_SECTION} more in the attached full report."))
+    return out
 
 
 def render_report(report: FinalReport, from_cache: bool = False) -> tuple[str, list[dict]]:
     s = report.submitted
     emoji = STATUS_EMOJI[report.status]
-    headline = f"{s.agent_name} — {s.current_release} readiness {report.score}/100 {report.status}"
+    release = s.current_release
+    headline = f"{s.agent_name} — {release} readiness {report.score}/100 {report.status}"
 
     breaking = [
-        f"*[{f['severity']}] {esc(f['title'])}* _(static check of your repository)_\n{esc(f['detail'])}\n_Where:_ `{esc(f['element'])}`"
+        _section(f"*[{f['severity']}] {esc(f['title'])}* _(static check of your repository)_\n"
+                 f"{esc(f['detail'])}\n_Where:_ `{esc(f['element'])}`")
         for f in report.static_findings
     ] + [
-        f"*[{i.severity}] {esc(i.title)}*\n_Where:_ {esc(i.affected_element)}\n"
-        f"_Why:_ {esc(i.evidence)}\n_Fix:_ {esc(i.fix)}\n{_quote(i)}\n{_cite(report, i)}"
+        _item_block(report, f"*[{i.severity}] {esc(i.title)}*",
+                    [("Today in your agent", i.current_state), (f"{release} change", i.release_change),
+                     ("What to do", i.fix)], i)
         for i in s.breaking_issues
     ]
     upcoming = [
-        f"*[{c.severity}] {esc(c.title)}* — _{esc(c.effective)}_\n_Impact:_ {esc(c.impact)}\n"
-        f"_Action:_ {esc(c.action_needed)}\n{_quote(c)}\n{_cite(report, c)}"
+        _item_block(report, f"*[{c.severity}] {esc(c.title)}* — _{esc(c.effective)}_",
+                    [("Today in your agent", c.current_state), ("What's coming", c.release_change),
+                     ("What to do", c.action_needed)], c)
         for c in s.upcoming_changes
     ]
-    enhancements = [
-        f"*{esc(e.feature)}*\n_Applies to:_ {esc(e.applies_to)}\n_Benefit:_ {esc(e.benefit)}\n{_quote(e)}\n{_cite(report, e)}"
-        for e in s.recommended_enhancements
-    ]
+    ga, preview = _split_enhancements(report)
+
+    def enh(e) -> dict:
+        label = "" if e.availability == "Generally Available" else f" _({esc(e.availability)})_"
+        return _item_block(report, f"*{esc(e.feature)}*{label}",
+                           [("Today in your agent", e.current_state), (f"What {release} adds", e.benefit),
+                            ("How to adopt", e.how_to_adopt)], e)
 
     project = f"API v{report.project_api_version} ({report.project_release})" if report.project_api_version else "API version unknown"
     meta = (
         f"{KIND_LABEL.get(report.agent_kind, report.agent_kind)} · {esc(report.location)} @ `{report.revision[:7]}` · "
-        f"Project {project} · Release assessed *{esc(s.current_release)}*"
+        f"Project {project} · Release assessed *{esc(release)}*"
     )
     p = s.agent_profile
     profile = (
         f"*Agent profile* _(from your repository)_\n*Use case:* {esc(p.business_use_case)}\n"
         f"*Capabilities:* {esc(', '.join(p.capabilities))}\n*Impact value:* {esc(p.impact_value)}"
     )
+    glance = (
+        f"*At a glance:* :red_circle: {len(breaking)} must fix · :large_yellow_circle: {len(upcoming)} upcoming · "
+        f":large_green_circle: {len(ga)} GA enhancement(s) · :test_tube: {len(preview)} beta/pilot"
+    )
 
     blocks: list[dict] = [
         {"type": "header", "text": {"type": "plain_text", "text": f"{headline}"[:150], "emoji": True}},
         _context(meta),
         _section(f"{emoji} {esc(s.executive_summary)}"),
+        _section(glance),
         _section(profile),
         {"type": "divider"},
-        *_list_section(":red_circle: Breaking / must fix", breaking),
+        *_group(":red_circle: Breaking / must fix", breaking),
         {"type": "divider"},
-        *_list_section(":large_yellow_circle: Upcoming changes needing action", upcoming),
+        *_group(":large_yellow_circle: Upcoming changes needing action", upcoming),
         {"type": "divider"},
-        *_list_section(":large_green_circle: Recommended enhancements", enhancements),
+        *_group(":large_green_circle: Enhancements — generally available", [enh(e) for e in ga]),
+        *_group(":test_tube: Enhancements — beta, pilot or preview (try in a sandbox)", [enh(e) for e in preview]),
     ]
 
     footer: list[str] = [esc(n) for n in s.notes]
     if report.score_breakdown:
         footer.append("Score: 100 " + " ".join(esc(b.split(" ", 1)[0]) for b in report.score_breakdown))
     if report.removed_findings:
-        footer.append(f"{len(report.removed_findings)} item(s) removed — quote not found on the cited release-notes page.")
-    if report.sections_read:
-        footer.append("Read in full: " + ", ".join(
-            f"{esc(r.section)} (pp. {r.printed_pages})" for r in report.sections_read))
+        footer.append(f"{len(report.removed_findings)} item(s) removed — release-notes quote or repository excerpt "
+                      "could not be verified.")
+    footer += [f":warning: {esc(line)}" for line in _coverage_warnings(report)]
+    if report.coverage:
+        c = report.coverage
+        footer.append(
+            f"Read {c.pages_read}/{c.total_pdf_pages} release-notes pages in {c.chunks} chunks; priority topics first"
+            + (f" ({', '.join(esc(s.section) for s in c.priority_sections[:6])})" if c.priority_sections else "")
+            + f". Agent scan: {len(report.dependencies_scanned)} file(s) incl. dependencies."
+        )
     footer.append(
-        f"Evidence: official Salesforce {esc(s.current_release)} release notes only; page numbers are the printed "
-        "page numbers." + (" _Cached result._" if from_cache else "")
+        f"Evidence: official Salesforce {esc(release)} release notes only; every item is tied to your agent's "
+        "script or metadata. Page numbers are printed page numbers." + (" _Cached result._" if from_cache else "")
     )
     blocks.append({"type": "divider"})
     blocks.append(_context("\n".join(f"• {line}" for line in footer)))
@@ -113,30 +148,54 @@ def render_report(report: FinalReport, from_cache: bool = False) -> tuple[str, l
     return f"{emoji} {headline}", blocks[:50]
 
 
+def _cell(text: str) -> str:
+    return (text or "—").replace("|", "\\|").replace("\r", "").replace("\n", "<br>").strip()
+
+
+def _table(headers: list[str], rows: list[list[str]]) -> list[str]:
+    out = ["| " + " | ".join(headers) + " |", "|" + "|".join("---" for _ in headers) + "|"]
+    out += ["| " + " | ".join(_cell(c) for c in row) + " |" for row in rows]
+    return out + [""]
+
+
 def render_markdown(report: FinalReport) -> str:
     """The complete report as Markdown (attached to the Slack thread, or written by the CLI)."""
     s = report.submitted
     p = s.agent_profile
+    release = s.current_release
+    ga, preview = _split_enhancements(report)
+    ids: list[tuple[str, object]] = []  # (id, item) in the order shown, for the evidence section
 
-    def cite(item) -> str:
+    def source(item) -> str:
         url = report.citation_url(item.printed_page)
-        label = report.citation_label(item.printed_page)
-        return f"*{item.section}*, [{label}]({url})" if url else f"*{item.section}*, {label}"
+        label = report.citation_label(item.printed_page).split(" (")[0]
+        return f"[{label}]({url})" if url else label
 
-    def quote(item) -> str:
-        return "> " + item.release_note_quote.strip().replace("\n", " ")
+    def tag(prefix: str, item) -> str:
+        ident = f"{prefix}{sum(1 for i, _ in ids if i.startswith(prefix)) + 1}"
+        ids.append((ident, item))
+        return ident
 
+    n_break = len(report.static_findings) + len(s.breaking_issues)
     out = [
-        f"# {s.agent_name} — {s.current_release} release readiness: {report.score}/100 ({report.status})",
+        f"# {s.agent_name} — {release} release readiness: {report.score}/100 ({report.status})",
         "",
         f"- Definition: {KIND_LABEL.get(report.agent_kind, report.agent_kind)}, {report.location} @ `{report.revision[:7]}`",
         f"- Project API version: {report.project_api_version or 'unknown'} ({report.project_release or 'n/a'})",
-        f"- Release assessed: {s.current_release}" + (f"; later release named in the notes: {s.upcoming_release}" if s.upcoming_release not in ("", "n/a") else ""),
+        f"- Release assessed: {release}" + (f"; later release named in the notes: {s.upcoming_release}" if s.upcoming_release not in ("", "n/a") else ""),
         "",
         "## Executive summary",
         "",
         s.executive_summary,
         "",
+        "## At a glance",
+        "",
+        *_table(["", "Count", "What it means"], [
+            ["🔴 Breaking / must fix", str(n_break), f"Changes in {release} that need a change in your agent now"],
+            ["🟡 Upcoming changes", str(len(s.upcoming_changes)), "Announced for a later date; plan the work"],
+            ["🟢 Enhancements — generally available", str(len(ga)), "Ready to adopt in production"],
+            ["🧪 Enhancements — beta / pilot / preview", str(len(preview)), "Try in a sandbox first"],
+        ]),
         "## Agent profile (from your repository)",
         "",
         f"**Business use case:** {p.business_use_case}",
@@ -152,28 +211,74 @@ def render_markdown(report: FinalReport) -> str:
         "## 🔴 Breaking / must fix",
         "",
     ]
-    if not report.static_findings and not s.breaking_issues:
-        out += ["_None found in the release notes._", ""]
-    for f in report.static_findings:
-        out += [f"### [{f['severity']}] {f['title']} (static check of your repository)", "", f["detail"], "",
-                f"Where: `{f['element']}`", ""]
-    for i in s.breaking_issues:
-        out += [f"### [{i.severity}] {i.title}", "", f"- **Where:** {i.affected_element}", f"- **Why:** {i.evidence}",
-                f"- **Fix:** {i.fix}", "", quote(i), "", f"Source: {cite(i)}", ""]
+    if report.static_findings:
+        out += ["**Found in your repository (static checks):**", ""]
+        out += _table(["Severity", "Issue", "Where", "Detail"],
+                      [[f["severity"], f["title"], f"`{f['element']}`", f["detail"]] for f in report.static_findings])
+    if s.breaking_issues:
+        out += _table(
+            ["#", "Severity", "What it means for your agent", "Today in your agent", f"{release} change", "What to do", "Source"],
+            [[tag("B", i), i.severity, f"**{i.title}**", i.current_state, i.release_change, i.fix, source(i)]
+             for i in s.breaking_issues])
+    if not n_break:
+        out += [f"_Nothing in the {release} release notes breaks this agent._", ""]
+
     out += ["## 🟡 Upcoming changes needing action", ""]
-    if not s.upcoming_changes:
+    if s.upcoming_changes:
+        out += _table(
+            ["#", "Severity", "What it means for your agent", "Today in your agent", "What's coming", "When", "What to do", "Source"],
+            [[tag("U", c), c.severity, f"**{c.title}**", c.current_state, c.release_change, c.effective, c.action_needed, source(c)]
+             for c in s.upcoming_changes])
+    else:
         out += ["_None found in the release notes._", ""]
-    for c in s.upcoming_changes:
-        out += [f"### [{c.severity}] {c.title} — {c.effective}", "", f"- **Impact:** {c.impact}",
-                f"- **Action:** {c.action_needed}", "", quote(c), "", f"Source: {cite(c)}", ""]
+
     out += ["## 🟢 Recommended enhancements", ""]
-    if not s.recommended_enhancements:
+    headers = ["#", "Enhancement for your agent", "Applies to", "Today in your agent", f"What {release} adds", "How to adopt", "Source"]
+    out += ["### Generally available — ready to adopt", ""]
+    if ga:
+        out += _table(headers, [
+            [tag("G", e), f"**{e.feature}**" + (" _(availability not labeled in the notes)_" if e.availability == "Not stated" else ""),
+             e.applies_to, e.current_state, e.benefit, e.how_to_adopt, source(e)] for e in ga])
+    else:
         out += ["_None found in the release notes._", ""]
-    for e in s.recommended_enhancements:
-        out += [f"### {e.feature}", "", f"- **Applies to:** {e.applies_to}", f"- **Benefit:** {e.benefit}", "",
-                quote(e), "", f"Source: {cite(e)}", ""]
-    out += ["## Release notes sections read in full", ""]
-    out += [f"- **{r.section}** (printed pages {r.printed_pages}): {r.reason}" for r in report.sections_read] or ["- none"]
+    out += ["### Beta, pilot and preview — try in a sandbox first", ""]
+    if preview:
+        out += _table(headers[:2] + ["Status"] + headers[2:], [
+            [tag("P", e), f"**{e.feature}**", e.availability, e.applies_to, e.current_state, e.benefit, e.how_to_adopt, source(e)]
+            for e in preview])
+    else:
+        out += ["_None found in the release notes._", ""]
+
+    if ids:
+        out += ["## Evidence", "",
+                "Each item is backed by the release notes (verbatim, checked against the cited page) and by your "
+                "repository (verbatim, checked against the cited file).", ""]
+        for ident, item in ids:
+            url = report.citation_url(item.printed_page)
+            label = report.citation_label(item.printed_page)
+            cite = f"[{label}]({url})" if url else label
+            quote = item.release_note_quote.strip().replace("\n", " ")
+            excerpt = item.repo_excerpt.strip().replace("\n", " ").replace("`", "'")
+            out += [f"**{ident}.** *{item.section}*, {cite}", "", f"> {quote}", "",
+                    f"In your agent: `{item.repo_path}` — `{excerpt}`", ""]
+
+    out += ["## How the release notes were read", ""]
+    c = report.coverage
+    if c:
+        out += [f"- Pages read: **{c.pages_read} of {c.total_pdf_pages}** PDF pages, in {c.chunks} chunks "
+                f"({c.priority_chunks} priority chunk(s) read first)."]
+        out += [f"- Priority topics: {', '.join(c.priority_topics)}"]
+        out += [f"- Candidate findings: {c.candidates_found} found while reading, "
+                f"{c.candidates_unverified} dropped because the quote was not on the cited page."]
+        if c.priority_sections:
+            out += ["- Priority sections:"]
+            out += [f"  - **{s_.section}** (printed pages {s_.printed_pages}): {s_.reason}" for s_ in c.priority_sections]
+    for line in _coverage_warnings(report):
+        out += [f"- ⚠️ {line}"]
+    if report.sections_read:
+        out += ["- Re-read while writing the report: " + ", ".join(f"{r.section} (pp. {r.printed_pages})" for r in report.sections_read)]
+    out += ["", "## Agent and dependencies scanned (from your repository)", ""]
+    out += [f"- `{path}`" for path in report.dependencies_scanned] or ["- none"]
     out += [""]
     if s.notes or report.removed_findings or report.score_breakdown:
         out += ["## Notes", ""]
@@ -181,9 +286,9 @@ def render_markdown(report: FinalReport) -> str:
         if report.score_breakdown:
             out += ["- Score: 100 " + "; ".join(report.score_breakdown)]
         if report.removed_findings:
-            out += [f"- Removed (quote not found on the cited page): {r}" for r in report.removed_findings]
+            out += [f"- Removed (evidence could not be verified): {r}" for r in report.removed_findings]
         out += [""]
-    out += [f"_Evidence: official Salesforce {s.current_release} release notes only. \"p.\" is the printed page number "
+    out += [f"_Evidence: official Salesforce {release} release notes only. \"p.\" is the printed page number "
             f"and \"PDF p.\" the page in the downloaded PDF; links open the official release notes._", ""]
     return "\n".join(out)
 

@@ -41,6 +41,7 @@ class AdvisorService:
         focus: str = "both",
         fresh: bool = False,
         progress: Callable[[str], None] | None = None,
+        rescan: bool = False,
     ) -> tuple[FinalReport, bool]:
         """Return (report, from_cache)."""
         target = self.advisor.notes.target_release()
@@ -50,11 +51,12 @@ class AdvisorService:
         bundle = self.source.load_agent(agent)
         # A new target release or newly added PDF must invalidate earlier reports.
         notes = ",".join(sorted(self.advisor.notes.configured_releases()))
-        key = ReportCache.key(agent.location, agent.name, bundle.revision, f"v2|{focus}|{target}|{notes}")
-        if not fresh:
+        topics = ",".join(self.settings.priority_topics)
+        key = ReportCache.key(agent.location, agent.name, bundle.revision, f"v4|{focus}|{target}|{notes}|{topics}")
+        if not (fresh or rescan):
             cached = self.cache.get(key)
             if cached:
                 return cached, True
-        report = self.advisor.analyze(bundle, question=question, focus=focus, progress=progress)
+        report = self.advisor.analyze(bundle, question=question, focus=focus, progress=progress, rescan=rescan)
         self.cache.put(key, report)
         return report, False

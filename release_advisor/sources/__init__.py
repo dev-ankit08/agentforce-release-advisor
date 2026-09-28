@@ -15,6 +15,7 @@ def build_source(settings: Settings) -> AgentSource:
             token=settings.github_token,
             branch=settings.github_branch,
             api_url=settings.github_api_url,
+            dependency_max_chars=settings.dependency_max_chars,
         )
     if settings.agent_source == "salesforce_org":
         from .salesforce_org_source import SalesforceOrgAgentSource

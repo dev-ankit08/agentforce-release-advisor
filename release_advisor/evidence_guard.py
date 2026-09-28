@@ -49,3 +49,23 @@ def check(quote: str, printed_page: int, doc: ReleaseNotesDoc) -> str | None:
     if needle in window:
         return None
     return f"quote not found on page {printed_page}"
+
+
+MIN_REPO_EXCERPT_CHARS = 8
+
+
+def check_repo(excerpt: str, path: str, files: dict[str, str]) -> str | None:
+    """Return None if the excerpt is verified in the cited repository file, else a short reason.
+
+    This enforces "only what applies to this agent": every item must point at the element of the
+    agent's Agent Script or metadata it applies to.
+    """
+    candidates = [p for p in files if p == path] or [p for p in files if path and (p.endswith("/" + path.lstrip("/")) or p.endswith(path))]
+    if not candidates:
+        return f"file {path or '(none)'} is not part of the agent or its dependencies"
+    needle = normalize(excerpt)
+    if len(needle) < MIN_REPO_EXCERPT_CHARS:
+        return "repository excerpt too short to verify"
+    if any(needle in normalize(files[p]) for p in candidates):
+        return None
+    return f"repository excerpt not found in {path}"

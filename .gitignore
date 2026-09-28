@@ -9,3 +9,7 @@ __pycache__/
 # local testing only
 tests/
 requirements-dev.txt
+
+# local run output
+run_log.txt
+run_summary.txt
