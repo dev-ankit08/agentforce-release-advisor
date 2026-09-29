@@ -92,7 +92,7 @@ No section is chosen or skipped by rules. `release_advisor/relevance.py` splits 
 **Preference for AI topics.** Sections and chunks about the `PRIORITY_TOPICS` are marked as priority. The defaults are Agentforce, Agent Script, AIforce, Claude, Einstein, Generative AI, AI, LLM, Prompt Builder, MCP, Data 360 and similar. A section is a priority section when its title names a topic, or when its pages mention the topics at least `PRIORITY_DENSITY` times per page (default 5). A chunk elsewhere counts as priority when its own pages are that dense. Priority chunks are:
 
 - read first,
-- read with `ANTHROPIC_MODEL` / `ANTHROPIC_EFFORT`. The other chunks use `SCAN_MODEL` / `SCAN_EFFORT`, which default to the same; lower them to save cost.
+- read with `ANTHROPIC_MODEL` / `ANTHROPIC_EFFORT` (default Sonnet 5 at `medium`). The other chunks use `SCAN_MODEL` / `SCAN_EFFORT` (default the same model at `low`).
 - marked `priority_topic` and listed first in the report.
 
 Every other chunk is still read in full. For Winter '27 that's all 1,096 PDF pages in 19 chunks, about 720k tokens, 6 of them priority chunks. The dossier prefix is cached across chunks, and chunks run `SCAN_CONCURRENCY` (default 4) at a time. A chunk that fails twice is reported as pages not read, never passed off as a complete read.
@@ -155,7 +155,7 @@ python -m release_advisor.cli notes search latest "Agent Script"
 
 ### 4. Claude
 
-Set `ANTHROPIC_API_KEY`. The defaults are `claude-opus-5`, adaptive thinking, and effort `high`, with server-side refusal fallbacks turned on. You can change these in `.env`.
+Set `ANTHROPIC_API_KEY`. The defaults keep cost down: `claude-sonnet-5` with adaptive thinking, effort `medium` for priority chunks and the report, and `low` for the other chunks. Server-side refusal fallbacks are off. For deeper analysis set `ANTHROPIC_MODEL=claude-opus-5` and a higher effort in `.env`. The bot logs the model it uses at startup.
 
 Try a full analysis from the terminal:
 
@@ -189,6 +189,8 @@ Socket Mode needs no public URL. The bot can run on any host that has outbound i
 | `/agent-release <AgentName> next` | Focuses on the upcoming release (`current` focuses on the current one) |
 | `/agent-release <AgentName> refresh` | Writes a new report. The agent scan and release-notes read for the same commit are reused (`cli analyze --rescan` re-reads them too) |
 | `@Release Advisor is Order_Status_Returns_Agent ready for the next release?` | Answers a free-text question in the thread |
+| `@Release Advisor I want release suggestions for the Knowledge agent` | Natural phrasing works: the agent is matched by the words of its name (`System_Knowledge_Agent` → "knowledge"). If several agents match, the bot asks which one |
+| Direct message to the bot, e.g. `release suggestions for Knowledge agent` | Same as a mention, no @ needed |
 
 Reports are cached per agent, commit SHA, and focus for `CACHE_TTL_HOURS` (default 24). A new commit to the agent triggers a new analysis automatically.
 

@@ -49,7 +49,38 @@ def resolve_agent(refs: list[AgentRef], text: str) -> tuple[AgentRef | None, lis
     partial = [r for r in refs if needle in _norm(r.name)]
     if len(partial) == 1:
         return partial[0], partial
-    return None, partial
+    if partial:
+        return None, partial
+    return _by_name_words(refs, text)
+
+
+# Words that appear in many agent names and say nothing about which agent is meant.
+_GENERIC_NAME_WORDS = {"agent", "agents", "agentforce", "bot", "the", "and", "for", "service", "employee"}
+
+
+def _name_words(name: str) -> set[str]:
+    """"System_Knowledge_Agent" / "OrderStatusAgent" -> {"system", "knowledge"} / {"order", "status"}."""
+    spaced = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", " ", name)
+    words = {w for w in re.split(r"[^A-Za-z0-9]+", spaced.lower()) if len(w) >= 3}
+    return words - _GENERIC_NAME_WORDS
+
+
+def _by_name_words(refs: list[AgentRef], text: str) -> tuple[AgentRef | None, list[AgentRef]]:
+    """Natural phrasing: "release suggestions for the Knowledge agent" -> System_Knowledge_Agent.
+
+    The agent whose distinctive name words appear most often in the text wins; a tie is ambiguous.
+    """
+    said = {w.rstrip("s") for w in re.findall(r"[a-z0-9]{3,}", text.lower())}
+    scored = []
+    for ref in refs:
+        hits = sum(1 for w in _name_words(ref.name) if w.rstrip("s") in said)
+        if hits:
+            scored.append((hits, ref))
+    if not scored:
+        return None, []
+    best = max(h for h, _ in scored)
+    top = [r for h, r in scored if h == best]
+    return (top[0], top) if len(top) == 1 else (None, top)
 
 
 __all__ = ["AgentBundle", "AgentRef", "AgentSource", "build_source", "resolve_agent"]

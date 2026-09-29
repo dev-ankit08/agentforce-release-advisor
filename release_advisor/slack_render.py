@@ -5,7 +5,6 @@ from __future__ import annotations
 from .report import PREVIEW_AVAILABILITY, FinalReport
 from .sources import AgentRef
 
-MAX_ITEMS_PER_SECTION = 5
 SECTION_TEXT_LIMIT = 2900  # Slack hard limit is 3000 chars per section text
 STATUS_EMOJI = {"Green": ":large_green_circle:", "Amber": ":large_orange_circle:", "Red": ":red_circle:"}
 KIND_LABEL = {"agent_script": "Agent Script", "legacy_planner": "Legacy Agent Builder"}
@@ -49,50 +48,52 @@ def _split_enhancements(report: FinalReport) -> tuple[list, list]:
             [e for e in items if e.availability in PREVIEW_AVAILABILITY])
 
 
+MAX_BLOCKS_PER_MESSAGE = 45  # Slack allows 50
+
+
 def _item_block(report: FinalReport, heading: str, cells: list[tuple[str, str]], item) -> dict:
     fields = [{"type": "mrkdwn", "text": f"*{label}*\n{esc(value)}"[:1990]} for label, value in cells if value]
     fields.append({"type": "mrkdwn", "text": f"*Source*\n{_cite(report, item)}"[:1990]})
     return {"type": "section", "text": {"type": "mrkdwn", "text": heading[:SECTION_TEXT_LIMIT]}, "fields": fields[:10]}
 
 
-def _group(title: str, blocks: list[dict], empty: str = "None found.") -> list[dict]:
-    if not blocks:
-        return [_section(f"*{title} (0)*\n_{empty}_")]
-    out = [_section(f"*{title} ({len(blocks)})*"), *blocks[:MAX_ITEMS_PER_SECTION]]
-    if len(blocks) > MAX_ITEMS_PER_SECTION:
-        out.append(_context(f"+{len(blocks) - MAX_ITEMS_PER_SECTION} more in the attached full report."))
-    return out
+def _enh_label(e) -> str:
+    return "" if e.availability == "Generally Available" else f" _({esc(e.availability)})_"
+
+
+def _summary_lines(report: FinalReport) -> dict[str, list[str]]:
+    """One line per item for the overview message."""
+    s = report.submitted
+    ga, preview = _split_enhancements(report)
+    page = lambda i: f"p. {i.printed_page}"
+    return {
+        "breaking": [f"• *[{f['severity']}]* {esc(f['title'])} _(static check)_" for f in report.static_findings]
+                    + [f"• *[{i.severity}]* {esc(i.title)} · {page(i)}" for i in s.breaking_issues],
+        "upcoming": [f"• *[{c.severity}]* {esc(c.title)} — _{esc(c.effective)}_ · {page(c)}" for c in s.upcoming_changes],
+        "ga": [f"• {esc(e.feature)} · {page(e)}" for e in ga],
+        "preview": [f"• {esc(e.feature)}{_enh_label(e)} · {page(e)}" for e in preview],
+    }
+
+
+def _lines_section(title: str, lines: list[str]) -> list[dict]:
+    if not lines:
+        return [_section(f"*{title} (0)*\n_None found._")]
+    out, chunk = [], f"*{title} ({len(lines)})*"
+    for line in lines:
+        if len(chunk) + len(line) + 1 > SECTION_TEXT_LIMIT:
+            out.append(_section(chunk))
+            chunk = ""
+        chunk = f"{chunk}\n{line}" if chunk else line
+    return out + [_section(chunk)]
 
 
 def render_report(report: FinalReport, from_cache: bool = False) -> tuple[str, list[dict]]:
+    """The overview message: status, summary, counts and one line per item. Details follow in the thread."""
     s = report.submitted
     emoji = STATUS_EMOJI[report.status]
     release = s.current_release
     headline = f"{s.agent_name} — {release} readiness {report.score}/100 {report.status}"
-
-    breaking = [
-        _section(f"*[{f['severity']}] {esc(f['title'])}* _(static check of your repository)_\n"
-                 f"{esc(f['detail'])}\n_Where:_ `{esc(f['element'])}`")
-        for f in report.static_findings
-    ] + [
-        _item_block(report, f"*[{i.severity}] {esc(i.title)}*",
-                    [("Today in your agent", i.current_state), (f"{release} change", i.release_change),
-                     ("What to do", i.fix)], i)
-        for i in s.breaking_issues
-    ]
-    upcoming = [
-        _item_block(report, f"*[{c.severity}] {esc(c.title)}* — _{esc(c.effective)}_",
-                    [("Today in your agent", c.current_state), ("What's coming", c.release_change),
-                     ("What to do", c.action_needed)], c)
-        for c in s.upcoming_changes
-    ]
-    ga, preview = _split_enhancements(report)
-
-    def enh(e) -> dict:
-        label = "" if e.availability == "Generally Available" else f" _({esc(e.availability)})_"
-        return _item_block(report, f"*{esc(e.feature)}*{label}",
-                           [("Today in your agent", e.current_state), (f"What {release} adds", e.benefit),
-                            ("How to adopt", e.how_to_adopt)], e)
+    lines = _summary_lines(report)
 
     project = f"API v{report.project_api_version} ({report.project_release})" if report.project_api_version else "API version unknown"
     meta = (
@@ -105,8 +106,8 @@ def render_report(report: FinalReport, from_cache: bool = False) -> tuple[str, l
         f"*Capabilities:* {esc(', '.join(p.capabilities))}\n*Impact value:* {esc(p.impact_value)}"
     )
     glance = (
-        f"*At a glance:* :red_circle: {len(breaking)} must fix · :large_yellow_circle: {len(upcoming)} upcoming · "
-        f":large_green_circle: {len(ga)} GA enhancement(s) · :test_tube: {len(preview)} beta/pilot"
+        f"*At a glance:* :red_circle: {len(lines['breaking'])} must fix · :large_yellow_circle: {len(lines['upcoming'])} upcoming · "
+        f":large_green_circle: {len(lines['ga'])} GA enhancement(s) · :test_tube: {len(lines['preview'])} beta/pilot"
     )
 
     blocks: list[dict] = [
@@ -116,15 +117,14 @@ def render_report(report: FinalReport, from_cache: bool = False) -> tuple[str, l
         _section(glance),
         _section(profile),
         {"type": "divider"},
-        *_group(":red_circle: Breaking / must fix", breaking),
-        {"type": "divider"},
-        *_group(":large_yellow_circle: Upcoming changes needing action", upcoming),
-        {"type": "divider"},
-        *_group(":large_green_circle: Enhancements — generally available", [enh(e) for e in ga]),
-        *_group(":test_tube: Enhancements — beta, pilot or preview (try in a sandbox)", [enh(e) for e in preview]),
+        *_lines_section(":red_circle: Breaking / must fix", lines["breaking"]),
+        *_lines_section(":large_yellow_circle: Upcoming changes needing action", lines["upcoming"]),
+        *_lines_section(":large_green_circle: Enhancements — generally available", lines["ga"]),
+        *_lines_section(":test_tube: Enhancements — beta, pilot or preview (try in a sandbox)", lines["preview"]),
     ]
 
-    footer: list[str] = [esc(n) for n in s.notes]
+    footer: list[str] = [":thread: *Full details for every item (today → this release → what to do) are in the thread below.*"]
+    footer += [esc(n) for n in s.notes]
     if report.score_breakdown:
         footer.append("Score: 100 " + " ".join(esc(b.split(" ", 1)[0]) for b in report.score_breakdown))
     if report.removed_findings:
@@ -144,8 +144,49 @@ def render_report(report: FinalReport, from_cache: bool = False) -> tuple[str, l
     )
     blocks.append({"type": "divider"})
     blocks.append(_context("\n".join(f"• {line}" for line in footer)))
-
     return f"{emoji} {headline}", blocks[:50]
+
+
+def render_report_details(report: FinalReport) -> list[tuple[str, list[dict]]]:
+    """Thread replies: one message per section with every item as Today / This release / What to do."""
+    s = report.submitted
+    release = s.current_release
+    ga, preview = _split_enhancements(report)
+
+    def enh(e) -> dict:
+        return _item_block(report, f"*{esc(e.feature)}*{_enh_label(e)}\n_Applies to:_ {esc(e.applies_to)}",
+                           [("Today in your agent", e.current_state), (f"What {release} adds", e.benefit),
+                            ("How to adopt", e.how_to_adopt)], e)
+
+    groups = [
+        (":red_circle: Breaking / must fix", [
+            _section(f"*[{f['severity']}] {esc(f['title'])}* _(static check of your repository)_\n"
+                     f"{esc(f['detail'])}\n_Where:_ `{esc(f['element'])}`") for f in report.static_findings
+        ] + [
+            _item_block(report, f"*[{i.severity}] {esc(i.title)}*",
+                        [("Today in your agent", i.current_state), (f"{release} change", i.release_change),
+                         ("What to do", i.fix)], i) for i in s.breaking_issues
+        ]),
+        (":large_yellow_circle: Upcoming changes needing action", [
+            _item_block(report, f"*[{c.severity}] {esc(c.title)}* — _{esc(c.effective)}_",
+                        [("Today in your agent", c.current_state), ("What's coming", c.release_change),
+                         ("What to do", c.action_needed)], c) for c in s.upcoming_changes
+        ]),
+        (":large_green_circle: Enhancements — generally available (ready to adopt)", [enh(e) for e in ga]),
+        (":test_tube: Enhancements — beta, pilot or preview (try in a sandbox first)", [enh(e) for e in preview]),
+    ]
+    messages: list[tuple[str, list[dict]]] = []
+    for title, items in groups:
+        if not items:
+            continue
+        page: list[dict] = [_section(f"*{title} ({len(items)})*")]
+        for item in items:
+            if len(page) + 2 > MAX_BLOCKS_PER_MESSAGE:
+                messages.append((title, page))
+                page = [_section(f"*{title} (continued)*")]
+            page += [item, {"type": "divider"}]
+        messages.append((title, page[:-1]))
+    return messages
 
 
 def _cell(text: str) -> str:

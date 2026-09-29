@@ -30,6 +30,9 @@ DEFAULT_ALLOWED_DOMAINS = [
 ]
 
 
+# Cost-conscious default: Claude Sonnet 5. Set ANTHROPIC_MODEL=claude-opus-5 for deeper analysis.
+DEFAULT_MODEL = "claude-sonnet-5"
+
 # Release-notes topics given preference. Short all-caps terms (AI, LLM) match as whole words, case-sensitive.
 DEFAULT_PRIORITY_TOPICS = [
     "Agentforce", "Agent Script", "AIforce", "Claude", "Einstein", "Generative AI", "AI", "LLM",
@@ -54,9 +57,9 @@ def _bool(name: str, default: bool) -> bool:
 @dataclass(frozen=True)
 class Settings:
     # Claude
-    anthropic_model: str = field(default_factory=lambda: os.getenv("ANTHROPIC_MODEL", "claude-opus-5"))
-    anthropic_effort: str = field(default_factory=lambda: os.getenv("ANTHROPIC_EFFORT", "high"))
-    enable_fallbacks: bool = field(default_factory=lambda: _bool("ANTHROPIC_ENABLE_FALLBACKS", True))
+    anthropic_model: str = field(default_factory=lambda: os.getenv("ANTHROPIC_MODEL", DEFAULT_MODEL))
+    anthropic_effort: str = field(default_factory=lambda: os.getenv("ANTHROPIC_EFFORT", "medium"))
+    enable_fallbacks: bool = field(default_factory=lambda: _bool("ANTHROPIC_ENABLE_FALLBACKS", False))
     max_agent_turns: int = field(default_factory=lambda: int(os.getenv("MAX_AGENT_TURNS", "25")))
     # Hosts release-notes PDFs may be downloaded from (explicit RELEASE_NOTES_PDF_URLS / legacy URLs).
     allowed_domains: list[str] = field(
@@ -80,10 +83,10 @@ class Settings:
     scan_concurrency: int = field(default_factory=lambda: int(os.getenv("SCAN_CONCURRENCY", "4")))
     # A section/chunk outside the topic-named sections is a priority one at this many topic mentions per page.
     priority_density: float = field(default_factory=lambda: float(os.getenv("PRIORITY_DENSITY", "5")))
-    # Model and effort for chunks outside the priority topics (every page is still read). Same as the main
-    # model and effort by default; lower them to save cost.
-    scan_model: str = field(default_factory=lambda: os.getenv("SCAN_MODEL") or os.getenv("ANTHROPIC_MODEL", "claude-opus-5"))
-    scan_effort: str = field(default_factory=lambda: os.getenv("SCAN_EFFORT") or os.getenv("ANTHROPIC_EFFORT", "high"))
+    # Model and effort for chunks outside the priority topics (every page is still read). Default: the main
+    # model at effort low.
+    scan_model: str = field(default_factory=lambda: os.getenv("SCAN_MODEL") or os.getenv("ANTHROPIC_MODEL", DEFAULT_MODEL))
+    scan_effort: str = field(default_factory=lambda: os.getenv("SCAN_EFFORT", "low"))
 
     # Dependency scan of the agent (dependencies.py): stop adding files beyond this many characters
     # (files left out are listed in the report, never dropped silently).

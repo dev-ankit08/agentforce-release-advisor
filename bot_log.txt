@@ -1,0 +1,6 @@
+2026-09-29 12:59:01,954 INFO release_advisor.slack_app: Claude models: report claude-sonnet-5 (effort medium), release-notes scan claude-sonnet-5 (effort low), fallbacks off
+2026-09-29 12:59:11,112 INFO slack_bolt.App: A new session has been established (session id: 8ca424dd-9576-4ac1-ab01-2ce14c4de102)
+2026-09-29 12:59:11,113 INFO slack_bolt.App: Bolt app is running!
+2026-09-29 12:59:11,197 INFO slack_bolt.App: Starting to receive messages from a new connection (session id: 8ca424dd-9576-4ac1-ab01-2ce14c4de102)
+2026-09-29 12:59:11,453 INFO release_advisor.release_notes: Winter '27 release notes already downloaded (1096 pages) - reusing
+2026-09-29 12:59:11,486 INFO release_advisor.slack_app: Release notes ready: Winter '27 (1096 pages)

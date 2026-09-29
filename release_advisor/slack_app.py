@@ -12,7 +12,7 @@ from slack_bolt.adapter.socket_mode import SocketModeHandler
 
 from .config import Settings, get_settings
 from .service import AdvisorService
-from .slack_render import USAGE, esc, render_agent_list, render_markdown, render_report
+from .slack_render import USAGE, esc, render_agent_list, render_markdown, render_report, render_report_details
 
 log = logging.getLogger(__name__)
 
@@ -41,10 +41,26 @@ def parse_request(text: str) -> dict:
 def build_app(settings: Settings) -> App:
     app = App(token=settings.slack_bot_token)
     service = AdvisorService(settings)
+
+    @app.middleware
+    def log_request(body, next):
+        """One line per request received, so "the app did not respond" can be told apart from "never arrived"."""
+        kind = body.get("command") or body.get("event", {}).get("type") or body.get("type")
+        log.info("Received %s from user %s: %s", kind, body.get("user_id") or body.get("event", {}).get("user"),
+                 (body.get("text") or body.get("event", {}).get("text") or "")[:120])
+        next()
     slots = threading.BoundedSemaphore(settings.max_concurrent_analyses)
     usage = USAGE.format(cmd=settings.slack_command)
 
-    def handle(text: str, say_blocks, post_status, update_status, upload=None) -> None:
+    def handle(text: str, say_blocks, post_status, update_status, upload=None, post_thread=None) -> None:
+        try:
+            _handle(text, say_blocks, post_status, update_status, upload, post_thread)
+        except Exception as exc:  # e.g. GitHub unreachable while listing agents: tell the user, don't go silent
+            log.exception("Request failed: %s", text)
+            say_blocks("Request failed", [{"type": "section", "text": {"type": "mrkdwn", "text":
+                       f":warning: I couldn't complete that request: {esc(str(exc))[:400]}\nPlease try again in a minute."}}])
+
+    def _handle(text: str, say_blocks, post_status, update_status, upload=None, post_thread=None) -> None:
         req = parse_request(text)
         if req["intent"] == "help":
             say_blocks("Usage", [{"type": "section", "text": {"type": "mrkdwn", "text": usage}}])
@@ -70,7 +86,10 @@ def build_app(settings: Settings) -> App:
             return
         status_ts = None
         try:
-            status_ts = post_status(f":mag: Analyzing *{esc(agent.name)}* against official Salesforce release notes… (usually 1–3 min)")
+            status_ts = post_status(
+                f":mag: Analyzing *{esc(agent.name)}* against the official Salesforce release notes… "
+                "The first run for a commit reads the whole document (about 5–10 min); later reports reuse that read."
+            )
             last = [0.0]
 
             def progress(msg: str) -> None:
@@ -84,6 +103,9 @@ def build_app(settings: Settings) -> App:
             )
             text, blocks = render_report(report, from_cache=cached)
             update_status(status_ts, text, blocks)
+            if post_thread:
+                for detail_text, detail_blocks in render_report_details(report):
+                    post_thread(status_ts, detail_text, detail_blocks)
             if upload and status_ts:
                 release = report.submitted.current_release.replace("'", "").replace(" ", "")
                 try:
@@ -122,7 +144,13 @@ def build_app(settings: Settings) -> App:
             client.files_upload_v2(channel=channel, thread_ts=ts, filename=filename, content=content,
                                    title="Full release report", initial_comment="Full report with every citation:")
 
-        handle(command.get("text", ""), say_blocks, post_status, update_status, upload)
+        def post_thread(ts, text, blocks):
+            if ts:
+                client.chat_postMessage(channel=channel, thread_ts=ts, text=text, blocks=blocks)
+            else:
+                respond(text=text, blocks=blocks, response_type="in_channel", replace_original=False)
+
+        handle(command.get("text", ""), say_blocks, post_status, update_status, upload, post_thread)
 
     @app.event("app_mention")
     def on_mention(event, client):
@@ -142,7 +170,17 @@ def build_app(settings: Settings) -> App:
             client.files_upload_v2(channel=channel, thread_ts=thread_ts, filename=filename, content=content,
                                    title="Full release report", initial_comment="Full report with every citation:")
 
-        handle(event.get("text", ""), say_blocks, post_status, update_status, upload)
+        def post_thread(_ts, text, blocks):
+            client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=text, blocks=blocks)
+
+        handle(event.get("text", ""), say_blocks, post_status, update_status, upload, post_thread)
+
+    @app.event("message")
+    def on_direct_message(event, client):
+        """Direct messages to the bot: no @mention needed. Channel messages are ignored (mentions cover those)."""
+        if event.get("channel_type") != "im" or event.get("bot_id") or event.get("subtype"):
+            return
+        on_mention(event, client)
 
     return app
 
@@ -153,6 +191,9 @@ def main() -> None:
     missing = [n for n, v in (("SLACK_BOT_TOKEN", settings.slack_bot_token), ("SLACK_APP_TOKEN", settings.slack_app_token)) if not v]
     if missing:
         raise SystemExit(f"Missing environment variables: {', '.join(missing)}")
+    log.info("Claude models: report %s (effort %s), release-notes scan %s (effort %s), fallbacks %s",
+             settings.anthropic_model, settings.anthropic_effort, settings.scan_model, settings.scan_effort,
+             "on" if settings.enable_fallbacks else "off")
     app = build_app(settings)
     threading.Thread(target=_prefetch_release_notes, args=(settings,), daemon=True).start()
     SocketModeHandler(app, settings.slack_app_token).start()

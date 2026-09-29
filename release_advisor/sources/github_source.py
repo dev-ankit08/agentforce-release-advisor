@@ -21,6 +21,8 @@ from dataclasses import dataclass
 from urllib.parse import quote, urlparse
 
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 from .. import dependencies
 from .base import MAX_CONTEXT_FILE_CHARS, AgentBundle, AgentRef, AgentSource, clip
@@ -152,7 +154,13 @@ class GitHubAgentSource(AgentSource):
     ):
         if not repo_urls:
             raise GitHubError("No repositories configured. Set GITHUB_REPOS to one or more GitHub repo URLs.")
-        self._session = session or requests.Session()
+        if session is None:
+            session = requests.Session()
+            # Corporate networks and proxies drop idle connections; retry those and GitHub's transient 5xx.
+            retry = Retry(total=3, connect=3, read=3, backoff_factor=1, status_forcelist=(502, 503, 504),
+                          allowed_methods=frozenset({"GET"}))
+            session.mount("https://", HTTPAdapter(max_retries=retry))
+        self._session = session
         self._session.headers.update({"X-GitHub-Api-Version": "2022-11-28", "User-Agent": "agentforce-release-advisor"})
         if token:
             self._session.headers["Authorization"] = f"Bearer {token}"
